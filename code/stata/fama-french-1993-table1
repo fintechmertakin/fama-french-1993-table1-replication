@@ -1,0 +1,353 @@
+// import ccm link
+import delimited "ccm_link.csv", clear varnames(1)
+
+gen datadate_s = date(datadate, "YMD")
+format datadate_s %td
+rename lpermno permno
+
+save ccm_link.dta, replace
+
+
+
+
+//import compustat
+import delimited "compustat_ff.csv", clear varnames(1)
+
+save compustat.dta, replace
+
+
+//import crsp
+
+import delimited "crsp_ff.csv", clear varnames(1)
+gen mdate = date(mthcaldt, "YMD")
+format mdate %td
+
+gen year  = year(mdate)
+
+save crsp.dta, replace
+
+
+//merge crsp with ccm link
+use crsp.dta, clear
+*gen year = year (mdate)
+collapse (mean) mthret (last) mthprc, by(permno year)
+rename year fyear
+save crsp_yearly.dta, replace
+
+use ccm_link.dta, clear
+merge m:1 permno fyear using crsp_yearly.dta
+
+
+duplicates list permno fyear
+duplicates drop permno fyear, force
+
+save crsp_ccm.dta, replace
+
+
+drop _merge
+
+//merge with compustat 
+
+
+//clean compustat
+use compustat.dta, clear
+
+gen datadate_s = date(datadate, "MDY")
+format datadate_s %td
+
+*gen fyear = year(datadate_s)
+
+save compustat.dta, replace
+
+use compustat.dta, clear
+keep if indfmt== "INDL"
+keep if datafmt== "STD"
+keep if consol== "C"
+
+duplicates report gvkey fyear
+
+bys gvkey fyear (datadate_s): keep if _n==1
+save compustat_clean.dta, replace
+
+// merge compustat with ccm+crsp_ccm
+use crsp_ccm.dta, clear
+drop _merge
+merge m:1 gvkey fyear using compustat_clean.dta, force
+ 
+duplicates report gvkey fyear permno
+
+save crsp_ccm_compustat.dta, replace
+
+//summary statistics
+
+count
+
+//unique firms
+egen n_firms = tag(gvkey)
+count if n_firms
+// number of unique firms by compustat id
+egen n_permnos = tag(permno)
+count if n_permnos
+
+
+
+****************************
+* 6.2 Compute Book Equity (BE) from Compustat (t−1 fiscal year)
+****************************
+use compustat_clean.dta, clear
+* If fyear not created yet:
+capture confirm variable fyear
+if _rc {
+    gen datadate_s = date(datadate, "YMD")
+    format datadate_s %td
+    gen fyear = year(datadate_s)
+}
+
+* Preferred stock: redemption -> liquidation -> par
+gen pstk_use = .
+replace pstk_use = pstkrv if !missing(pstkrv)
+replace pstk_use = pstkl  if missing(pstk_use) & !missing(pstkl)
+replace pstk_use = pstk   if missing(pstk_use) & !missing(pstk)
+
+* Book Equity (BE)
+gen be = seq + cond(missing(txditc),0,txditc) - cond(missing(pstk_use),0,pstk_use)
+
+* keep minimal vars
+keep gvkey fyear be datadate
+tempfile comp_be
+save `comp_be', replace
+
+
+****************************
+* 7. Create monthly Market Equity and extract Dec (t−1) and Jun (t)
+****************************
+use crsp_raw.dta, clear
+* You already imported these earlier; ensure they exist:
+* mdate (daily %td), mthprc, mthret, shrout (actual shares), permno, vwretd, rf, primaryexch
+
+* month & year
+gen calyear = year(mdate)
+gen calmon  = month(mdate)
+
+* Market Equity each month
+gen me = abs(mthprc)*shrout
+drop if missing(me) | me<=0
+
+* ----- Dec ME (t−1) -----
+preserve
+keep if calmon==12
+keep permno calyear me
+rename calyear year_dec
+rename me       me_dec
+tempfile decme
+save `decme', replace
+restore
+
+* ----- Jun ME (t) -----
+preserve
+keep if calmon==6
+keep permno calyear me primaryexch
+rename calyear portyear         // June of year t defines portfolio year t
+rename me       me_jun
+* primaryexch used as NYSE proxy: "N"~NYSE, "A"~AMEX, "Q"~NASDAQ (common CRSP coding)
+tempfile junme
+save `junme', replace
+restore
+
+
+****************************
+* 8. Align Dec (t−1) ME with Jun t portfolios; attach BE (t−1)
+****************************
+use `junme', clear
+* Add Dec (t−1) ME by shifting Dec year forward to portfolio year = DecYear+1
+merge 1:1 permno portyear using `decme', keepusing(me_dec) ///
+    keep(1 3) nogen update
+
+* attach gvkey via CCM (already cleaned earlier)
+merge m:1 permno using ccm_link_clean.dta, keep(match) nogen
+
+* attach BE (t−1): fyear should equal portyear-1
+gen fyear_tm1 = portyear - 1
+merge m:1 gvkey fyear using `comp_be', keepusing(be) keep(3) nogen
+
+* compute BE/ME for sorts (exclude negative BE for sorting)
+drop if missing(me_dec) | me_dec<=0
+drop if missing(be)
+drop if be<=0
+
+gen beme = be / me_dec
+
+* keep compact
+keep permno gvkey portyear me_jun me_dec beme primaryexch
+tempfile sortbase
+save `sortbase', replace
+
+
+
+****************************
+* 9. Compute NYSE breakpoints and assign 25 portfolios (5×5 Size × BE/ME)
+****************************
+use `sortbase', clear
+
+* --- compute NYSE breakpoints each portyear
+preserve
+keep if primaryexch=="N"  // proxy for NYSE stocks
+collapse (p20) size_p20=me_jun (p40) size_p40=me_jun (p60) size_p60=me_jun (p80) size_p80=me_jun ///
+         (p20) bm_p20=beme  (p40) bm_p40=beme  (p60) bm_p60=beme  (p80) bm_p80=beme, by(portyear)
+tempfile brk
+save `brk', replace
+restore
+
+* merge breakpoints back to full universe (NYSE+AMEX+NASDAQ)
+merge m:1 portyear using `brk', nogen keep(match)
+
+* assign size quintile 1..5 using NYSE cutpoints
+gen szq = .
+replace szq = 1 if me_jun <= size_p20
+replace szq = 2 if me_jun >  size_p20 & me_jun <= size_p40
+replace szq = 3 if me_jun >  size_p40 & me_jun <= size_p60
+replace szq = 4 if me_jun >  size_p60 & me_jun <= size_p80
+replace szq = 5 if me_jun >  size_p80
+
+* assign value (BE/ME) quintile 1..5 using NYSE cutpoints
+gen bmq = .
+replace bmq = 1 if beme <= bm_p20
+replace bmq = 2 if beme >  bm_p20 & beme <= bm_p40
+replace bmq = 3 if beme >  bm_p40 & beme <= bm_p60
+replace bmq = 4 if beme >  bm_p60 & beme <= bm_p80
+replace bmq = 5 if beme >  bm_p80
+
+* 25-portfolio id: rows (size) × columns (value)
+gen port25 = (szq-1)*5 + bmq   // 1..25
+
+* keep formation panel
+tempfile formed
+save `formed', replace
+
+
+****************************
+* 10. Build Table 1 descriptors
+*     - Avg annual avg firm size (ME, $mm)
+*     - Avg annual % of total market value
+*     - Avg annual BE/ME
+*     - Avg annual number of firms
+****************************
+use `formed', clear
+
+* firm size in $ millions
+gen me_jun_mil = me_jun/1e6
+
+* annual totals by portfolio-year
+collapse (mean) avg_size = me_jun_mil  (mean) avg_beme = beme ///
+         (sum) mv_sum = me_jun  (count) nfirms = permno, by(portyear port25)
+
+* total market value across all 25 portfolios each year
+bys portyear: egen mv_total = total(mv_sum)
+gen pct_mv = 100*mv_sum/mv_total
+
+* keep only 1963–1991 (FF93 sample)
+keep if inrange(portyear,1963,1991)
+
+tempfile t1annual
+save `t1annual', replace
+
+* FINAL TABLE 1: average across years
+collapse (mean) avg_size avg_beme pct_mv nfirms, by(port25)
+
+* optionally reshape to 5×5 grid (rows size quintile, cols value quintile)
+gen szq = ceil(port25/5)
+gen bmq = mod(port25,5)
+replace bmq = 5 if bmq==0
+
+tempfile table1
+save `table1', replace
+
+
+****************************
+* 11. FF3 monthly factors (needs monthly returns)
+****************************
+* Re-create the mapping (permno, portyear, szq, bmq) at June t
+use `formed', clear
+keep permno portyear szq bmq
+tempfile june_map
+save `june_map', replace
+
+* Bring monthly CRSP back; build month-year and portfolio year for each month.
+use crsp_raw.dta, clear
+* Month and year already created; ensure:
+gen calyear = year(mdate)
+gen calmon  = month(mdate)
+
+* Portfolio year = for months Jul..Dec use current year; for Jan..Jun use previous year
+gen portyear = calyear
+replace portyear = calyear - 1 if calmon<=6
+
+* Keep months in sample window
+keep if inrange(portyear,1963,1991)
+
+* compute monthly ME for value-weights
+gen me = abs(mthprc)*shrout
+drop if missing(me) | me<=0
+
+* attach the June t assignment
+merge m:1 permno portyear using `june_map', keep(3) nogen
+
+* build 2×3 portfolios (size: S if szq<=3 vs B if szq>=4; value: L bmq<=2, M bmq==3, H bmq>=4)
+gen S = szq<=3
+gen B = szq>=4
+gen L = bmq<=2
+gen M = bmq==3
+gen H = bmq>=4
+
+* value-weighted monthly returns for each of the 6 legs
+tempfile legs
+collapse (sum) me_w = me (sum) me_ret = me*mthret, ///
+    by(portyear calyear calmon S B L M H)
+* Expand into named legs
+gen leg = ""
+replace leg="SL" if S & L
+replace leg="SM" if S & M
+replace leg="SH" if S & H
+replace leg="BL" if B & L
+replace leg="BM" if B & M
+replace leg="BH" if B & H
+drop if leg==""
+gen r_leg = me_ret/me_w
+keep portyear calyear calmon leg r_leg
+tempfile rlegs
+save `rlegs', replace
+
+* reshape to wide
+use `rlegs', clear
+reshape wide r_leg, i(portyear calyear calmon) j(leg) string
+
+* SMB and HML
+gen SMB = ( (r_legSL + r_legSM + r_legSH)/3 ) - ( (r_legBL + r_legBM + r_legBH)/3 )
+gen HML = ( (r_legSH + r_legBH)/2 ) - ( (r_legSL + r_legBL)/2 )
+
+* Market (Rm − Rf)
+* Pull market return and rf from monthly CRSP
+merge 1:1 portyear calyear calmon using crsp_raw.dta, keepusing(vwretd rf) nogen
+gen Mkt_RF = vwretd - rf
+
+* Save FF3 factors
+keep portyear calyear calmon Mkt_RF SMB HML
+order portyear calyear calmon Mkt_RF SMB HML
+tempfile ff3
+save `ff3', replace
+
+****************************
+* 12. Save deliverables
+****************************
+* Final dataset with factors and Table 1 inputs
+use `formed', clear
+merge 1:m portyear using `t1annual', nogen
+save final_ff_yourname.dta, replace
+
+* FF3 factors (monthly)
+use `ff3', clear
+save ff3_factors_mertakin.dta, replace
+
+* Table 1 (averaged across 1963–1991)
+use `table1', clear
+save table1_mertakin.dta, replace
